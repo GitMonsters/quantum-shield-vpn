@@ -1,0 +1,53 @@
+[package]
+name = "quantum_shield_vpn"
+version = "1.0.0"
+edition = "2021"
+description = "Quantum-resistant VPN with ML-KEM (Kyber) + X25519 hybrid encryption"
+
+[[bin]]
+name = "qs-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "qs-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "qs-keygen"
+path = "src/bin/keygen.rs"
+
+[dependencies]
+# Post-quantum cryptography
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+
+# Classical cryptography (hybrid approach)
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+blake3 = "1.5"
+rand = "0.8"
+
+# Networking
+tokio = { version = "1.35", features = ["full"] }
+tun = "0.6"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+base64 = "0.21"
+hex = "0.4"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
