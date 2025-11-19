@@ -6,6 +6,7 @@
 //! - ChaCha20-Poly1305 for symmetric encryption
 
 pub mod crypto;
+pub mod tun_device;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

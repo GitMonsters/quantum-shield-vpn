@@ -108,6 +108,44 @@ impl HybridKeypair {
             },
         })
     }
+
+    /// Load keypair from secret bytes only (derives public keys)
+    pub fn from_secret_bytes(secret_bytes: &[u8]) -> Result<Self> {
+        if secret_bytes.len() < 32 + 3168 {
+            return Err(anyhow!("Invalid secret key length"));
+        }
+
+        // Extract X25519 secret and derive public
+        let mut x25519_bytes = [0u8; 32];
+        x25519_bytes.copy_from_slice(&secret_bytes[..32]);
+        let x25519_secret = StaticSecret::from(x25519_bytes);
+        let x25519_public = X25519PublicKey::from(&x25519_secret);
+
+        // Extract Kyber secret (public key is embedded in last 1568 bytes of secret)
+        let kyber_secret = kyber1024::SecretKey::from_bytes(&secret_bytes[32..])
+            .map_err(|_| anyhow!("Invalid Kyber secret key"))?;
+
+        // Kyber1024 secret key: last 1568 bytes contain the public key
+        let kyber_public_bytes = &secret_bytes[secret_bytes.len() - 1568..];
+
+        Ok(HybridKeypair {
+            public: HybridPublicKey {
+                x25519: x25519_public.to_bytes(),
+                kyber: kyber_public_bytes.to_vec(),
+            },
+            secret: HybridSecretKey {
+                x25519: x25519_secret,
+                kyber: kyber_secret,
+            },
+        })
+    }
+}
+
+impl HybridPublicKey {
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("Failed to serialize public key")
+    }
 }
 
 /// Perform key encapsulation (client side)

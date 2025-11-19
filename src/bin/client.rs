@@ -1,8 +1,9 @@
-//! QuantumShield VPN Client
+//! QuantumShield VPN Client with TUN support
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use quantum_shield_vpn::crypto::{self, HybridKeypair, SessionKeys};
+use quantum_shield_vpn::tun_device::TunDevice;
 use quantum_shield_vpn::{
     build_packet, parse_packet, HandshakePacket, HandshakeResponse, PacketType,
 };
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
@@ -24,25 +25,26 @@ struct Args {
     server: String,
 
     /// Server public key file
-    #[arg(long, default_value = "quantum_shield_server.pub")]
+    #[arg(long, default_value = "keys/qs_server.pub")]
     server_key: PathBuf,
 
-    /// Client public key file
-    #[arg(long, default_value = "quantum_shield_client.pub")]
-    public_key: PathBuf,
-
     /// Client secret key file
-    #[arg(long, default_value = "quantum_shield_client.key")]
-    secret_key: PathBuf,
+    #[arg(long, default_value = "keys/qs_client.key")]
+    private_key: PathBuf,
+
+    /// MTU size
+    #[arg(long, default_value = "1400")]
+    mtu: i32,
 }
 
 struct Client {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     keypair: HybridKeypair,
     server_public: crypto::HybridPublicKey,
-    session_keys: RwLock<Option<SessionKeys>>,
-    assigned_ip: RwLock<Option<[u8; 4]>>,
+    session_keys: Arc<RwLock<Option<SessionKeys>>>,
+    assigned_ip: Arc<RwLock<Option<[u8; 4]>>>,
     tx_sequence: AtomicU64,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl Client {
@@ -50,8 +52,9 @@ impl Client {
         server_addr: &str,
         keypair: HybridKeypair,
         server_public: crypto::HybridPublicKey,
+        tun_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         socket.connect(server_addr).await?;
 
         info!("Connected to server: {}", server_addr);
@@ -60,13 +63,14 @@ impl Client {
             socket,
             keypair,
             server_public,
-            session_keys: RwLock::new(None),
-            assigned_ip: RwLock::new(None),
+            session_keys: Arc::new(RwLock::new(None)),
+            assigned_ip: Arc::new(RwLock::new(None)),
             tx_sequence: AtomicU64::new(1),
+            tun_tx,
         })
     }
 
-    async fn handshake(&self) -> Result<()> {
+    async fn handshake(&self) -> Result<[u8; 4]> {
         info!("Initiating quantum-resistant handshake...");
 
         // Perform key encapsulation
@@ -114,7 +118,7 @@ impl Client {
                         response.assigned_ip[3]
                     );
 
-                    Ok(())
+                    Ok(response.assigned_ip)
                 } else {
                     Err(anyhow!("Handshake failed: server rejected"))
                 }
@@ -141,11 +145,7 @@ impl Client {
         Ok(())
     }
 
-    async fn run(&self) -> Result<()> {
-        // Perform handshake
-        self.handshake().await?;
-
-        // Main loop - receive packets
+    async fn run_socket_handler(self: Arc<Self>) -> Result<()> {
         let mut buf = vec![0u8; 65535];
 
         loop {
@@ -184,15 +184,11 @@ impl Client {
                     .as_ref()
                     .ok_or_else(|| anyhow!("No active session"))?;
 
-                // Decrypt payload
+                // Decrypt payload (IP packet from server)
                 let decrypted = crypto::decrypt(&keys.decrypt_key, header.sequence, payload)?;
 
-                // Here you would write to the TUN interface
-                info!(
-                    "Received {} bytes of data (seq: {})",
-                    decrypted.len(),
-                    header.sequence
-                );
+                // Send to TUN device
+                self.tun_tx.send(decrypted).await?;
             }
             PacketType::Keepalive => {
                 // Respond with keepalive
@@ -217,7 +213,6 @@ impl Client {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -228,26 +223,95 @@ async fn main() -> Result<()> {
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
     // Load client keypair
-    let public_bytes = base64::decode(fs::read_to_string(&args.public_key)?)?;
-    let secret_bytes = base64::decode(fs::read_to_string(&args.secret_key)?)?;
-    let keypair = HybridKeypair::from_bytes(&public_bytes, &secret_bytes)?;
+    let secret_bytes = base64::decode(fs::read_to_string(&args.private_key)?.trim())?;
+    let keypair = HybridKeypair::from_secret_bytes(&secret_bytes)?;
 
     info!("Loaded client keypair");
+    info!("Client fingerprint: {}", {
+        let public_bytes = keypair.public.to_bytes();
+        let hash = blake3::hash(&public_bytes);
+        hex::encode(&hash.as_bytes()[..8])
+    });
 
     // Load server public key
-    let server_public_bytes = base64::decode(fs::read_to_string(&args.server_key)?)?;
+    let server_public_bytes = base64::decode(fs::read_to_string(&args.server_key)?.trim())?;
     let server_public: crypto::HybridPublicKey = bincode::deserialize(&server_public_bytes)?;
 
     info!("Loaded server public key");
     info!("Server fingerprint: {}", {
         let hash = blake3::hash(&server_public_bytes);
-        hex::encode(&hash.as_bytes()[..16])
+        hex::encode(&hash.as_bytes()[..8])
     });
 
-    // Create and run client
-    let client = Arc::new(Client::new(&args.server, keypair, server_public).await?);
+    // Channel for TUN packets
+    let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(1000);
+
+    // Create client
+    let client = Arc::new(
+        Client::new(&args.server, keypair, server_public, tun_tx).await?,
+    );
 
     info!("Starting quantum-resistant VPN connection...");
 
-    client.run().await
+    // Perform handshake to get assigned IP
+    let assigned_ip = client.handshake().await?;
+    let tun_ip = format!(
+        "{}.{}.{}.{}",
+        assigned_ip[0], assigned_ip[1], assigned_ip[2], assigned_ip[3]
+    );
+
+    // Create TUN device with assigned IP
+    info!("Creating TUN device with IP {}...", tun_ip);
+    let mut tun = TunDevice::new(&tun_ip, "255.255.255.0", args.mtu)?;
+    info!("TUN device {} created", tun.name());
+
+    // Spawn socket handler
+    let client_clone = Arc::clone(&client);
+    let socket_handle = tokio::spawn(async move {
+        if let Err(e) = client_clone.run_socket_handler().await {
+            error!("Socket handler error: {}", e);
+        }
+    });
+
+    // Spawn TUN reader (reads from TUN, sends to server)
+    let client_clone = Arc::clone(&client);
+    let tun_read_handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match tun.read_packet(&mut buf) {
+                Ok(len) => {
+                    if len > 0 {
+                        if let Err(e) = client_clone.send_data(&buf[..len]).await {
+                            warn!("Failed to send data: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("TUN read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Spawn TUN writer (receives from channel, writes to TUN)
+    let tun_write_handle = tokio::spawn(async move {
+        let mut tun_write = TunDevice::new(&tun_ip, "255.255.255.0", args.mtu)
+            .expect("Failed to open TUN for writing");
+
+        while let Some(packet) = tun_rx.recv().await {
+            if let Err(e) = tun_write.write_packet(&packet) {
+                error!("TUN write error: {}", e);
+            }
+        }
+    });
+
+    // Wait for tasks
+    tokio::select! {
+        _ = socket_handle => {}
+        _ = tun_read_handle => {}
+        _ = tun_write_handle => {}
+    }
+
+    Ok(())
 }

@@ -1,6 +1,6 @@
 # QuantumShield VPN
 
-**Quantum-resistant VPN with post-quantum cryptography**
+**Quantum-resistant VPN with post-quantum cryptography and TUN device support**
 
 ## Security Features
 
@@ -26,8 +26,8 @@ cargo build --release
 
 Binaries are in `target/release/`:
 - `qs-keygen` - Generate quantum-resistant keypairs
-- `qs-server` - VPN server
-- `qs-client` - VPN client
+- `qs-server` - VPN server with TUN device
+- `qs-client` - VPN client with TUN device
 
 ## Quick Start
 
@@ -35,38 +35,61 @@ Binaries are in `target/release/`:
 
 ```bash
 # Generate server keys
-./target/release/qs-keygen --server --output ./keys --name quantum_shield
+./target/release/qs-keygen --name qs_server --output keys/
 
 # Generate client keys
-./target/release/qs-keygen --client --output ./keys --name quantum_shield
+./target/release/qs-keygen --name qs_client --output keys/
 ```
 
 This creates:
-- `keys/quantum_shield_server.pub` - Server public key
-- `keys/quantum_shield_server.key` - Server secret key (keep secure!)
-- `keys/quantum_shield_client.pub` - Client public key
-- `keys/quantum_shield_client.key` - Client secret key (keep secure!)
+- `keys/qs_server.pub` - Server public key (share with clients)
+- `keys/qs_server.key` - Server secret key (keep secure!)
+- `keys/qs_client.pub` - Client public key
+- `keys/qs_client.key` - Client secret key (keep secure!)
 
-### 2. Start Server
+### 2. Start Server (requires root)
 
 ```bash
-./target/release/qs-server \
+sudo ./target/release/qs-server \
     --listen 0.0.0.0:51820 \
-    --public-key keys/quantum_shield_server.pub \
-    --secret-key keys/quantum_shield_server.key \
-    --subnet 10.0.0.0/24
+    --private-key keys/qs_server.key \
+    --tun-ip 10.0.0.1
 ```
 
-### 3. Connect Client
+### 3. Connect Client (requires root)
 
-Copy `quantum_shield_server.pub` to the client machine, then:
+Copy `qs_server.pub` to the client machine, then:
 
 ```bash
-./target/release/qs-client \
+sudo ./target/release/qs-client \
     --server YOUR_SERVER_IP:51820 \
-    --server-key keys/quantum_shield_server.pub \
-    --public-key keys/quantum_shield_client.pub \
-    --secret-key keys/quantum_shield_client.key
+    --server-key keys/qs_server.pub \
+    --private-key keys/qs_client.key
+```
+
+The client will:
+1. Perform quantum-resistant handshake
+2. Receive assigned IP (e.g., 10.0.0.2)
+3. Create TUN device with that IP
+4. Route traffic through encrypted tunnel
+
+## Server Options
+
+```
+--listen         Listen address (default: 0.0.0.0:51820)
+--private-key    Server private key file
+--tun-ip         TUN device IP (default: 10.0.0.1)
+--tun-netmask    TUN netmask (default: 255.255.255.0)
+--mtu            MTU size (default: 1400)
+```
+
+## Client Options
+
+```
+--server         Server address (required)
+--server-key     Server public key file
+--private-key    Client private key file
+--mtu            MTU size (default: 1400)
 ```
 
 ## Protocol Overview
@@ -92,6 +115,7 @@ Client                                    Server
   |                                          |
   |  ========== Encrypted Tunnel =========   |
   |  ChaCha20-Poly1305 with derived keys     |
+  |  IP packets through TUN device           |
   |                                          |
 ```
 
@@ -107,23 +131,23 @@ Client                                    Server
 | Combined Shared Secret | 64 bytes |
 | Session Keys | 32 bytes each |
 
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Linux | Full support with TUN device |
+| macOS | Full support with TUN device |
+| iOS | Requires NetworkExtension app |
+| Windows | Not yet implemented |
+
 ## Security Considerations
 
 1. **Keep secret keys secure** - They have 0600 permissions by default
 2. **Verify server fingerprints** - Displayed on connection
-3. **No hardcoded passwords** - Unlike the vulnerable VPNs in the research paper
+3. **No hardcoded passwords** - Unlike vulnerable VPNs
 4. **No deprecated ciphers** - Uses modern, audited algorithms
 5. **Perfect forward secrecy** - Each session derives new keys
-
-## Comparison with Vulnerable VPNs
-
-| Feature | QuantumShield | Turbo VPN, etc. |
-|---------|---------------|-----------------|
-| Key Exchange | ML-KEM + X25519 | Hard-coded Shadowsocks |
-| Encryption | ChaCha20-Poly1305 | RC4-MD5 (deprecated) |
-| Passwords | Unique per connection | Hard-coded, shared |
-| Quantum-safe | Yes | No |
-| Traffic decryptable | No | Yes, by anyone |
+6. **Run as root** - Required for TUN device creation
 
 ## Development
 
